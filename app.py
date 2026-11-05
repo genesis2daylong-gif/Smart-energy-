@@ -1,6 +1,6 @@
 """Smart Energy Saving - prototype (Streamlit)
 รัน: streamlit run app.py
-มี 2 โหมด: (1) กรอกหน่วยไฟรายเดือนเอง  (2) ข้อมูลรายชั่วโมงจากไฟล์ CSV
+มี 3 โหมด: (1) กรอกอุปกรณ์ (2) กรอกหน่วยไฟรายเดือน (3) ข้อมูลรายชั่วโมงจากไฟล์ CSV
 """
 import numpy as np
 import pandas as pd
@@ -124,10 +124,169 @@ def manual_mode(rate):
                f"(คิดเป็น {saved_kwh / (last['per_day'] * 30) * 100:.0f}% ของเดือนล่าสุด)")
 
 
+
+# ====================== โหมด 0: กรอกเครื่องใช้ไฟฟ้า (จำนวน + ชั่วโมง/วัน) ======================
+C_NAME, C_W, C_QTY, C_H, C_DUTY = ("อุปกรณ์", "กำลังไฟ (วัตต์)", "จำนวน (ชิ้น)",
+                                   "ชั่วโมงใช้/วัน", "ตัวคูณการทำงาน (0-1)")
+
+# ค่าตั้งต้นโดยประมาณของอุปกรณ์ในหอ (แก้ได้ในตาราง ควรเช็กจากป้ายหลังเครื่อง)
+APPLIANCE_DEFAULTS = pd.DataFrame({
+    C_NAME: ["แอร์", "พัดลม", "หลอดไฟ LED", "ตู้เย็น", "ทีวี", "แล็ปท็อป",
+             "ที่ชาร์จมือถือ", "กาต้มน้ำ", "ไมโครเวฟ", "หม้อหุงข้าว",
+             "เครื่องทำน้ำอุ่น", "ไดร์เป่าผม", "อื่น ๆ (ใส่วัตต์เอง)"],
+    C_W: [900, 50, 9, 100, 80, 50, 10, 1500, 1000, 600, 3500, 1200, 0],
+    C_QTY: [1, 1, 2, 1, 0, 1, 1, 1, 0, 0, 0, 0, 0],
+    C_H: [8, 10, 5, 24, 0, 6, 3, 0.2, 0, 0, 0, 0, 0],
+    C_DUTY: [0.35, 1, 1, 0.35, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+})
+
+
+def estimate_appliances(raw, days, bill_kwh=0.0, calibrate=True):
+    """kWh/เดือน = วัตต์ x จำนวน x ตัวคูณ x ชั่วโมง/วัน x วัน / 1000
+    ถ้ามียอดบิลจริง จะปรับค่าแอร์ให้ผลรวมตรงกับบิล"""
+    df = raw.rename(columns={C_NAME: "name", C_W: "watt", C_QTY: "qty",
+                             C_H: "h", C_DUTY: "duty"}).copy()
+    df["name"] = df["name"].fillna("").astype(str)
+    for c in ["watt", "qty", "h", "duty"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    df["watt"] = df["watt"].clip(lower=0)
+    df["qty"] = df["qty"].clip(lower=0)
+    df["h"] = df["h"].clip(0, 24)
+    df["duty"] = df["duty"].clip(0, 1)
+    df = df[(df["watt"] > 0) & (df["qty"] > 0) & (df["h"] > 0)].reset_index(drop=True)
+    if df.empty:
+        return None
+
+    df["kw"] = df["watt"] * df["qty"] * df["duty"] / 1000      # กำลังไฟเฉลี่ยตอนใช้งาน (kW)
+    df["is_ac"] = df["name"].str.contains("แอร์")
+    total_day = float((df["kw"] * df["h"]).sum())
+    est_before = total_day * days
+
+    factor, how = 1.0, None
+    if bill_kwh > 0 and calibrate:
+        ac_day = float((df["kw"] * df["h"])[df["is_ac"]].sum())
+        other_day = total_day - ac_day
+        target_day = bill_kwh / days
+        if ac_day > 0 and target_day > other_day:
+            factor, how = (target_day - other_day) / ac_day, "ac"
+            df.loc[df["is_ac"], "kw"] *= factor
+        else:
+            factor, how = target_day / total_day, "all"
+            df["kw"] *= factor
+
+    df["kwh_day"] = df["kw"] * df["h"]
+    df["kwh_month"] = df["kwh_day"] * days
+    df["share"] = df["kwh_month"] / df["kwh_month"].sum() * 100
+    return {"table": df, "est_before": est_before,
+            "est_after": float(df["kwh_month"].sum()), "factor": factor, "how": how}
+
+
+def appliance_mode(rate):
+    st.subheader("🔌 กรอกเครื่องใช้ไฟฟ้าในห้อง")
+    st.caption("ใส่ **จำนวน** และ **ชั่วโมงใช้ต่อวัน** ของแต่ละอุปกรณ์ (ไม่ต้องรู้เรื่องวัตต์) "
+               "ค่าวัตต์เป็นค่าโดยประมาณทั่วไป แก้ได้ ส่วนแอร์/ตู้เย็นไม่ได้กินไฟเต็มกำลังตลอดเวลา "
+               "จึงมี \"ตัวคูณการทำงาน\" ช่วยลดค่าลง กด + ท้ายตารางเพื่อเพิ่มอุปกรณ์อื่น")
+    edited = st.data_editor(
+        APPLIANCE_DEFAULTS, num_rows="dynamic", hide_index=True, key="appl",
+        column_config={
+            C_NAME: st.column_config.TextColumn(C_NAME),
+            C_W: st.column_config.NumberColumn(C_W, min_value=0, step=1),
+            C_QTY: st.column_config.NumberColumn(C_QTY, min_value=0, step=1),
+            C_H: st.column_config.NumberColumn(C_H, min_value=0, max_value=24, step=0.5),
+            C_DUTY: st.column_config.NumberColumn(C_DUTY, min_value=0.0, max_value=1.0, step=0.05),
+        })
+    c1, c2 = st.columns(2)
+    days = c1.number_input("จำนวนวันในเดือน", 28, 31, 30)
+    bill = c2.number_input("หน่วยไฟในบิลจริง (kWh) ไม่บังคับ", 0.0, 3000.0, 0.0, 1.0)
+    calibrate = True
+    if bill > 0:
+        calibrate = st.checkbox("ปรับค่าแอร์ให้ผลรวมตรงกับบิลจริง", value=True)
+
+    res = estimate_appliances(edited, days, bill, calibrate)
+    if res is None:
+        st.info("ใส่กำลังไฟ จำนวน และชั่วโมงอย่างน้อย 1 อุปกรณ์เพื่อเริ่มคำนวณ")
+        return
+    t = res["table"]
+    total = res["est_after"]
+
+    # ---- สรุป ----
+    st.markdown("### ผลการคำนวณ")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("ใช้ไฟต่อเดือน (ประมาณ)", f"{total:.0f} kWh")
+    m2.metric("ค่าไฟโดยประมาณ", f"{total * rate:,.0f} บาท")
+    m3.metric("เฉลี่ยต่อวัน", f"{total / days:.1f} kWh")
+
+    if bill > 0:
+        err = (res["est_before"] - bill) / bill * 100
+        st.info(f"เทียบกับบิลจริง {bill:.0f} kWh: ค่าที่คำนวณจากข้อมูลที่กรอก (ก่อนปรับเทียบ) "
+                f"ได้ {res['est_before']:.0f} kWh ({err:+.0f}%)")
+        if calibrate and res["how"] == "ac":
+            st.write(f"ปรับค่าแอร์เป็น **{res['factor']:.2f} เท่า** ของที่ตั้งไว้ "
+                     "เพื่อให้ผลรวมตรงกับบิล")
+            if not 0.5 <= res["factor"] <= 1.6:
+                st.warning("ค่าปรับต่างจากที่ตั้งไว้มาก ลองเช็กชั่วโมงใช้งานของแอร์ "
+                           "หรืออุปกรณ์อื่นที่กรอกอีกครั้ง")
+        elif calibrate and res["how"] == "all":
+            st.warning("ปรับแอร์อย่างเดียวไม่พอ (ไม่มีแอร์ หรืออุปกรณ์อื่นรวมแล้วเกินบิล) "
+                       f"จึงปรับทุกอุปกรณ์ตามสัดส่วนเป็น {res['factor']:.2f} เท่า")
+
+    show = (t.assign(cost=t["kwh_month"] * rate)
+              .sort_values("kwh_month", ascending=False)
+              [["name", "qty", "h", "kwh_month", "cost", "share"]]
+              .rename(columns={"name": "อุปกรณ์", "qty": "จำนวน", "h": "ชม./วัน",
+                               "kwh_month": "kWh/เดือน", "cost": "บาท/เดือน",
+                               "share": "สัดส่วน (%)"}))
+    st.dataframe(show.round(1), hide_index=True)
+    st.plotly_chart(px.pie(t, names="name", values="kwh_month",
+                           title="สัดส่วนการใช้ไฟตามอุปกรณ์"))
+
+    # ---- คำแนะนำ ----
+    st.markdown("### 💡 คำแนะนำสำหรับห้องของคุณ")
+    top = t.sort_values("kwh_month", ascending=False).iloc[0]
+    st.write(f"• **{top['name']}** กินไฟมากที่สุด {top['share']:.0f}% "
+             f"(≈ {top['kwh_month'] * rate:,.0f} บาท/เดือน) เป็นอุปกรณ์ที่ควรลดเป็นอันดับแรก")
+    ac = t[t["is_ac"]]
+    if not ac.empty:
+        ac_row = ac.iloc[0]
+        st.write(f"• แอร์ 1 ชั่วโมง ≈ {ac_row['kw']:.2f} kWh ≈ {ac_row['kw'] * rate:.1f} บาท "
+                 f"ลดวันละ 1 ชั่วโมงประหยัดได้ประมาณ **{ac_row['kw'] * days * rate:,.0f} บาท/เดือน**")
+        st.write("• ตั้งอุณหภูมิ 26°C และใช้ timer ช่วยลดชั่วโมงที่แอร์ทำงานได้")
+    st.write("• ถอดปลั๊กอุปกรณ์ที่ไม่ใช้ เช่น ที่ชาร์จ/ทีวี เพื่อลดไฟแฝง")
+
+    # ---- จำลอง ----
+    st.markdown("### 🎛️ ถ้าลดชั่วโมงการใช้งาน")
+    top3 = t.sort_values("kwh_month", ascending=False).head(3)
+    cut_day_kwh = 0.0
+    for i, r in top3.iterrows():
+        step = 0.5 if r["h"] >= 1 else 0.1
+        default = min(1.0, float(r["h"])) if r["is_ac"] else 0.0
+        cut = st.slider(f"ลด {r['name']} วันละ (ชั่วโมง)", 0.0, float(r["h"]),
+                        default, step, key=f"cut_{i}")
+        cut_day_kwh += r["kw"] * cut
+    saved = cut_day_kwh * days
+    st.success(f"ประหยัดได้ประมาณ **{saved:.0f} kWh/เดือน ≈ {saved * rate:,.0f} บาท/เดือน** "
+               f"({saved / total * 100:.0f}% ของทั้งหมด)")
+
+    # ---- คาดการณ์เดือนหน้า ----
+    st.markdown("### 🔮 คาดการณ์เดือนหน้า")
+    nd = st.number_input("จำนวนวันของเดือนหน้า", 28, 31, 30)
+    base = t["kwh_day"].sum() * nd
+    plan = (t["kwh_day"].sum() - cut_day_kwh) * nd
+    f1, f2 = st.columns(2)
+    f1.metric("ถ้าใช้เหมือนเดิม", f"{base:.0f} kWh", f"≈ {base * rate:,.0f} บาท")
+    f2.metric("ถ้าทำตามแผนลดด้านบน", f"{plan:.0f} kWh", f"≈ {plan * rate:,.0f} บาท",
+              delta_color="off")
+    st.caption("เป็นค่าประมาณจากข้อมูลที่กรอก ไม่ได้คำนึงถึงสภาพอากาศหรือพฤติกรรมที่เปลี่ยนไป")
+
+
 # ====================== ตัวเลือกโหมด ======================
-mode = st.sidebar.radio("เลือกโหมด", ["🧮 กรอกค่าไฟเอง", "📊 ข้อมูลรายชั่วโมง (CSV)"])
+mode = st.sidebar.radio("เลือกโหมด", ["🔌 กรอกอุปกรณ์ (แนะนำ)", "🧮 กรอกค่าไฟรายเดือน",
+                                       "📊 ข้อมูลรายชั่วโมง (CSV)"])
 rate = st.sidebar.number_input("ค่าไฟ (บาท/หน่วย)", value=4.5, step=0.1)
 
+if mode.startswith("🔌"):
+    appliance_mode(rate)
+    st.stop()
 if mode.startswith("🧮"):
     manual_mode(rate)
     st.stop()
