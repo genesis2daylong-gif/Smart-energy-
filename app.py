@@ -47,7 +47,11 @@ MONTH_DEFAULTS = pd.DataFrame({
     M_DAYS: [30, 31], M_AC: [8.0, 5.0]})
 
 THAI = {"air_conditioner": "แอร์", "fan": "พัดลม", "fridge": "ตู้เย็น",
-        "laptop": "แล็ปท็อป", "tv": "ทีวี", "kettle": "กาต้มน้ำ"}
+        "laptop": "แล็ปท็อป", "tv": "ทีวี", "kettle": "กาต้มน้ำ",
+        "led_light": "หลอดไฟ LED", "phone_charger": "ที่ชาร์จมือถือ",
+        "microwave": "ไมโครเวฟ", "rice_cooker": "หม้อหุงข้าว",
+        "water_heater": "เครื่องทำน้ำอุ่น", "hair_dryer": "ไดร์เป่าผม",
+        "wifi_router": "เราเตอร์ Wi-Fi", "washing_machine": "เครื่องซักผ้า", "iron": "เตารีด"}
 
 
 # ================================================================ ชุดคำนวณกลาง
@@ -166,8 +170,11 @@ def csv_profile(raw):
     prof["is_ac"] = prof["name"].map(is_ac_name)
     prof = prof[prof["kwh_day"] > 0].reset_index(drop=True)
 
-    daily = (d.groupby("date").agg(kwh=("kwh", "sum"), temp=("temperature", "mean"))
-               .reset_index())
+    # อุณหภูมิเฉลี่ยต่อวัน: เฉลี่ยจาก "แต่ละชั่วโมง" (ไม่ถ่วงด้วยจำนวนแถวของอุปกรณ์)
+    temp_day = (d.groupby("datetime")["temperature"].first()
+                  .groupby(lambda x: x.normalize()).mean())
+    daily = pd.DataFrame({"kwh": d.groupby("date")["kwh"].sum(),
+                          "temp": temp_day}).rename_axis("date").reset_index()
     d["ym"] = d["datetime"].dt.to_period("M").astype(str)
     months = d.groupby("ym").agg(kwh=("kwh", "sum"), days=("date", "nunique")).reset_index()
     months = months.rename(columns={"ym": "month"})
@@ -209,30 +216,40 @@ def ai_tab(daily, rate):
     d = daily.copy()
     d["date"] = pd.to_datetime(d["date"])
     use_temp = d["temp"].notna().all()
+    # ทำนาย "สัดส่วนเทียบค่าเฉลี่ย 7 วันก่อนหน้า" แทนค่า kWh ตรง ๆ เพื่อให้จับแนวโน้มที่ลดลง/เพิ่มขึ้นได้
+    base = d["kwh"].shift(1).rolling(7).mean()
     feat = pd.DataFrame({"dow": d["date"].dt.dayofweek,
-                         "lag1": d["kwh"].shift(1), "lag2": d["kwh"].shift(2)})
+                         "r1": d["kwh"].shift(1) / base, "r2": d["kwh"].shift(2) / base})
     if use_temp:
         feat["temp"] = d["temp"]
-    ok = feat.dropna().index
-    X, y = feat.loc[ok], d.loc[ok, "kwh"]
+    ratio = d["kwh"] / base
+    ok = feat.dropna().index.intersection(ratio.dropna().index)
+    X, y = feat.loc[ok], ratio.loc[ok]
     if len(X) < 14:
         st.info("ข้อมูลยังน้อยเกินไปสำหรับการพยากรณ์")
         return
     n_test = 7
     model = RandomForestRegressor(n_estimators=200, random_state=42).fit(X[:-n_test], y[:-n_test])
-    mae = mean_absolute_error(y[-n_test:], model.predict(X[-n_test:]))
+    base_t = base.loc[ok].values[-n_test:]
+    actual = d.loc[ok, "kwh"].values[-n_test:]
+    mae = mean_absolute_error(actual, model.predict(X[-n_test:]) * base_t)
+    mae_naive = mean_absolute_error(actual, base_t)   # วิธีง่าย ๆ: ใช้ค่าเฉลี่ย 7 วันก่อน
     nxt = d["date"].iloc[-1] + pd.Timedelta(days=1)
-    row = {"dow": nxt.dayofweek, "lag1": d["kwh"].iloc[-1], "lag2": d["kwh"].iloc[-2]}
+    base_next = float(d["kwh"].tail(7).mean())
+    row = {"dow": nxt.dayofweek, "r1": d["kwh"].iloc[-1] / base_next,
+           "r2": d["kwh"].iloc[-2] / base_next}
     if use_temp:
         row["temp"] = d["temp"].tail(7).mean()
-    pred = float(model.predict(pd.DataFrame([row])[X.columns])[0])
+    pred = float(model.predict(pd.DataFrame([row])[X.columns])[0]) * base_next
 
     a, b = st.columns(2)
     a.metric(f"พยากรณ์ {nxt:%d %b}", f"{pred:.1f} kWh", f"≈ {pred * rate:.0f} บาท", delta_color="off")
     b.metric("ความคลาดเคลื่อน (MAE)", f"{mae:.2f} kWh/วัน",
              f"{mae / d['kwh'].mean() * 100:.0f}% ของค่าเฉลี่ย", delta_color="off")
-    st.caption("Random Forest ทำนายไฟวันถัดไปจากวันในสัปดาห์ ไฟ 2 วันก่อนหน้า "
-               "และอุณหภูมิ (ถ้ามี) ทดสอบกับ 7 วันสุดท้ายที่โมเดลไม่เคยเห็น")
+    verdict = ("ดีกว่า" if mae < mae_naive else "ยังไม่ดีกว่า")
+    st.caption("Random Forest ทำนายไฟวันถัดไปจากวันในสัปดาห์ ไฟ 2 วันก่อนหน้า และอุณหภูมิ (ถ้ามี) "
+               "ทดสอบกับ 7 วันสุดท้ายที่โมเดลไม่เคยเห็น เทียบกับวิธีง่าย ๆ (ใช้ค่าเฉลี่ย 7 วันก่อน) "
+               f"ที่คลาดเคลื่อน {mae_naive:.2f} kWh/วัน โมเดล{verdict}วิธีง่าย ๆ ในชุดข้อมูลนี้")
 
     thr = d["kwh"].mean() + 2 * d["kwh"].std()
     d["flag"] = d["kwh"] > thr
@@ -303,7 +320,12 @@ def render(res, rate):
     with t_dev:
         p = prof.copy()
         p["share"] = p["kwh_day"] / total_day * 100
-        fig = px.pie(p, names="name", values="kwh_day", hole=0.5,
+        pie = p.loc[p["share"] >= 3, ["name", "kwh_day"]]
+        rest = p.loc[p["share"] < 3, "kwh_day"].sum()
+        if rest > 0:  # รวมอุปกรณ์ที่สัดส่วนน้อยเป็น "อื่น ๆ" ให้กราฟอ่านง่าย
+            pie = pd.concat([pie, pd.DataFrame({"name": ["อื่น ๆ"], "kwh_day": [rest]})],
+                            ignore_index=True)
+        fig = px.pie(pie, names="name", values="kwh_day", hole=0.5,
                      color_discrete_sequence=PALETTE)
         fig.update_traces(textinfo="percent")
         st.plotly_chart(style(fig, 320))
@@ -418,7 +440,8 @@ elif src == "อัปโหลด CSV":
 else:
     try:
         result = csv_profile(load_sample())
-        st.caption("ข้อมูลจำลองรายชั่วโมงของห้องหอพัก 1 ห้อง (ปรับให้ตรงกับยอดบิลจริง ก.ย. 151 และ ต.ค. 127 kWh)")
+        st.caption("ข้อมูลจำลองรายชั่วโมง ส.ค.–พ.ย. 2026 ของห้องหอพัก 1 ห้อง (15 อุปกรณ์) "
+                   "ก.ย./ต.ค. ปรับให้ตรงกับบิลจริง 151 และ 127 kWh ส่วน ส.ค./พ.ย. เป็นข้อมูลจำลอง")
     except Exception as e:
         st.error(f"โหลดข้อมูลตัวอย่างไม่ได้: {e}")
 
